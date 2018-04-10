@@ -1,0 +1,417 @@
+# -*- coding: utf-8 -*-
+"""
+指令解析处理模块
+解析指令参数
+将指令参数打包成数据
+"""
+import binascii
+import socket
+import struct
+import random
+from time import ctime
+try:
+    import ujson as json
+except ImportError:
+    import json
+
+__all__ = ['JsonPacket']
+
+
+class BasePacket(object):
+    HEADLEN = 4
+    _received = False
+
+    def __init__(self, data=''):
+        self.cache_data = data
+
+    @classmethod
+    def get_identity(cls):
+        return random.randint(0, 9999999)
+
+    @classmethod
+    def pack(cls, data):
+        """
+            将json数据序列化成指令数据
+        """
+        raise NotImplementedError
+
+    def decode(self):
+        """
+            流式解码函数，将外部数据发送至生成器
+            直到数据解码成功
+
+            decode = self.decode()
+            try:
+                decode.send(None)
+                while not self.received():
+                    decode.send(somedata)
+            except StopIteration:
+                pass
+        """
+        raise NotImplementedError
+
+    def received(self):
+        return self._received
+
+    def receive_from_socket(self, sock):
+        decode = self.decode()
+        try:
+            decode.send(None)
+            while not self.received():
+                data = sock.recv(4096)
+                if data:
+                    decode.send(data)
+                else:
+                    raise socket.error
+        except StopIteration as e:
+            if len(e.args):
+                raise
+
+
+class JsonPacket(BasePacket):
+    @classmethod
+    def pack(cls, data):
+        # 不需要确认的指令可以不需要 ident 字段
+        if not data.get('ident'):
+            data['ident'] = cls.get_identity()
+        pack_data = json.dumps(data, ensure_ascii=False)
+        return struct.pack('>HH', data['type'], len(pack_data)) + pack_data.encode("utf-8")
+
+    def decode(self):
+        self._received = False
+        if self.cache_data:
+            data = self.cache_data
+        else:
+            data = ''
+        while len(data) < self.HEADLEN:
+            complement = yield
+            if not complement:
+                raise StopIteration('not data can parse')
+            data += complement
+        # self.type = struct.unpack('>H', data[0:2])[0]
+        self.length = struct.unpack('>H', data[2:4])[0]
+        TOTALLEN = self.HEADLEN + self.length
+        while len(data) < TOTALLEN:
+            complement = yield
+            if not complement:
+                raise StopIteration('not data can parse')
+            data += complement
+        self.data = json.loads((data[self.HEADLEN:TOTALLEN]).decode('utf-8'))
+        self.cache_data = data[TOTALLEN:]
+        self._received = True
+
+    def __repr__(self):
+        data = getattr(self, 'data', '')
+        if data:
+            data = json.dumps(data, sort_keys=True)
+            string = '<Packet(%s) %s 0x%s>' % (data, 'receive' if self._received else 'suspend', id(self))
+        else:
+            string = ''
+        if self.cache_data:
+            string2 = '<Packet(%s) %s 0x%s>' % (self.cache_data, 'cached' if self._received else 'suspend', id(self))
+            string = string + '\n' + string2 if string else string2
+        return string
+
+
+"""
+模拟器类
+"""
+import threading
+import socket
+import datetime
+import time
+
+from collections import namedtuple
+
+try:
+    import Queue
+except ImportError:
+    import queue as Queue
+
+Packet = JsonPacket
+
+Cell = namedtuple('Cell', 'mcc mnc lacid cellid rxlev')
+
+
+class Emulate(object):
+    def __init__(self, host, port, imei='355372020827303', imsi='460001515535328',
+                 iccid='89860113859009347034', version=1, modules='L0P0', heartbeat=60, vendor=20000):
+        self.address = (host, port)
+        self.imei = imei
+        self.vendor = vendor
+        self.imsi = imsi
+        self.heartbeat = heartbeat
+        self.version = version
+        self.modules = modules
+        self.vendor = vendor
+        self.iccid = iccid
+        self._sock = None
+        self._queue = Queue.Queue()
+        self.loop_started = 0
+        self._last_info = (None, None)
+        self._status = False
+        self.packet = Packet()
+        self.connect()
+        self.login()
+        # self.battery()
+        # self.timeLock()
+        # self.weather()
+
+    def connect(self):
+        self._sock = socket.socket()
+        self._sock.connect(self.address)
+        self._status = True
+        return self._sock
+
+    def login(self):
+        self.send({
+            'type': 1,
+            'imei': self.imei,
+            'imsi': self.imsi,
+            'version': self.version,
+            'vendor': self.vendor,
+            'iccid': self.iccid,
+            # 'vendor': self.vendor,
+            'modules': self.modules
+        })
+
+    def send(self, data):
+        if self.loop_started:
+            self._queue.put(data)
+        else:
+            self._sock.send(self.packet.pack(data))
+
+    def _send(self):
+        while self._status:
+            data = self._queue.get()
+            if not data:
+                self._status = False
+                return None
+            self._sock.send(self.packet.pack(data))
+
+    def battery(self):
+        self.send({
+            'type': 21,
+            'battery': 10,
+            'max_level': 4,
+            'curr_level': 1
+        })
+
+    def step(self):
+        self.send({
+            'type': 41,
+            'step': 51
+        })
+
+    def recv(self):
+        self.packet.receive_from_socket(self._sock)
+        print(self.packet)
+
+        try:
+            itype = self.packet.data['type']
+            ident = self.packet.data.get('ident')
+        except KeyError:
+            return None
+
+        self._last_info = (itype, ident)
+
+        method = getattr(self, 'action_%s' % itype, None)
+        if method:
+            method()
+        else:
+            self.react()
+
+    def heartbeat_loop(self):
+        while 1:
+            time.sleep((self.heartbeat * 1) + 1)
+            if not self._status:
+                break
+            self.send({
+                'type': 3,
+            })
+
+    def _loop(self):
+        send_thread = threading.Thread(target=self._send)
+        send_thread.daemon = True
+        send_thread.start()
+        self.loop_started = 1
+        try:
+            while 1:
+                self.recv()
+        except socket.error:
+            print('%s socket terminate' % datetime.datetime.now())
+        finally:
+            self._status = False
+            self._queue.put(None)
+            # wait the send loop thread exit
+            time.sleep(0.1)
+
+    def loop(self, block=True):
+        heartbeat_thread = threading.Thread(target=self.heartbeat_loop)
+        heartbeat_thread.daemon = True
+        heartbeat_thread.start()
+        if block:
+            self._loop()
+        else:
+            recv_thread = threading.Thread(target=self._loop)
+            recv_thread.daemon = True
+            recv_thread.start()
+
+    def timeLock(self):
+        self.send({
+            'type': 5,
+            'ident': 8,
+            'cells': [{
+                'mcc': 460,
+                'mnc': 0,
+                'lac': 21485,
+                'ci': 5142,
+                'rxlev': -78
+            }]
+        })
+
+    def weather(self):
+        self.send({
+            'type': 17,
+            'ident': 8,
+            'cells': [{
+                'mcc': 460,
+                'mnc': 0,
+                'lac': 21485,
+                'ci': 5142,
+                'rxlev': -78
+            }]
+        })
+
+    def locate(self, lbs=None, gps=None, timestamp=None):
+        data = {
+            'type': 7,
+            'feedback': 1,
+        }
+        if lbs:
+            data['cells'] = [{
+                'mcc': i.mcc,
+                'mnc': i.mnc,
+                'lac': i.lacid,
+                'ci': i.cellid,
+                'rxlev': i.rxlev,
+            } for i in lbs]
+        if gps:
+            data['gps'] = {
+                'lon': gps[0],
+                'lat': gps[1],
+            }
+        data['timestamp'] = time.time() if not timestamp else timestamp
+        return data
+
+    def react(self):
+        itype, ident = self._last_info
+        if itype % 2 == 0:
+            data = {'type': itype}
+            if ident:
+                data['ident'] = ident
+            self.send(data)
+
+    def action_8(self):
+        self.react()
+
+        global n
+        if n % 2 == 0:
+            # 广东省广州市天河区科智路靠近科城大厦
+            data = self.locate([
+                Cell(mcc=460, mnc=0, lacid=9475, cellid=44901, rxlev=32),
+                Cell(mcc=460, mnc=0, lacid=9475, cellid=17252, rxlev=23),
+            ])
+            # data = self.locate(gps=(113.4395958, 23.1659372))
+            self.send(data)
+        else:
+            # 广东省广州市黄埔区揽月路靠近最牛的牛杂
+            data = self.locate([
+                Cell(mcc=460, mnc=0, lacid=9475, cellid=61009, rxlev=51),
+                Cell(mcc=460, mnc=0, lacid=9475, cellid=21855, rxlev=33),
+                Cell(mcc=460, mnc=0, lacid=9475, cellid=18671, rxlev=26),
+                Cell(mcc=460, mnc=0, lacid=9475, cellid=26963, rxlev=23),
+                Cell(mcc=460, mnc=0, lacid=9475, cellid=50168, rxlev=19),
+                Cell(mcc=460, mnc=0, lacid=10331, cellid=58526, rxlev=13),
+            ])
+            # data = self.locate(gps=(113.4590952,23.1681934))
+            self.send(data)
+
+        n += 1
+
+
+n = 0
+
+imei = 666666666666100
+def task(func):
+    import argparse
+    global imei
+    parser = argparse.ArgumentParser(
+        description='emulate the device connect to server',
+        conflict_handler='resolve',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    # 120.79.91.207
+    # 119.23.203.236
+    parser.add_argument('-h', '--host', default='119.23.203.236', help='server host')
+
+    parser.add_argument('-p', '--port', type=int, default=11500, help='server port')
+    parser.add_argument('--imei', default=str(imei), help='emulate imei')
+    parser.add_argument('--imsi', default='460001515535328', help='emulate imsi')
+    parser.add_argument('--iccid', default='89860113859009347034', help='emulate iccid')
+    parser.add_argument('--version', default=1, help='emulate version')
+    parser.add_argument('--vendor', default=20000, help='emulate vendor')
+    parser.add_argument('--counts', type=int, default=1, help='emulate counts')
+
+    # args = parser.parse_args()
+    # host=args.host
+    # port=args.port
+    # imei=args.imei
+    # imsi=args.imsi
+    # iccid=args.iccid
+    # version=args.version
+    # vendor=args.vendor
+    # counts=args.counts
+    # # for i in range(counts):
+    # # imei=str(int(imei)+1)
+    # # imsi=str(int(imsi)+1)
+    # emulate = Emulate(host, port, imei, imsi, iccid, version, vendor)
+
+    args = parser.parse_args()
+    emulate = Emulate(host=args.host, port=args.port, imei=args.imei, imsi=args.imsi, iccid=args.iccid,
+                      version=args.version, vendor=args.vendor)
+    # emulate = Emulate(host=args.host, port=args.port, imei=str(imei), imsi=args.imsi, iccid=args.iccid,
+    #                   version=args.version, vendor=args.vendor)
+    data = emulate.locate([
+       Cell(mcc=460, mnc=0, lacid=9475, cellid=44901, rxlev=32),
+       Cell(mcc=460, mnc=0, lacid=9475, cellid=17252, rxlev=23),
+    ])
+    emulate.send(data)
+
+    # data = emulate.locate(gps=(113.4395958, 23.1659372))
+    # emulate.send(data)
+    # emulate.send({'type': 1235})
+
+    emulate.loop()
+    imei += 1
+    print "tread number:%s, time:%s" % (func, ctime())
+
+threads = []
+times = 10
+for i in range(times):
+    name = threading.Thread(target=task, args=(i,))
+    threads.append(name)
+
+print 'start:', ctime()
+
+# for i in range(0, times):
+#     threads[i].start()
+# for i in range(0, times):
+#     threads[i].join()
+
+for t in threads:
+    t.setDaemon(True)
+    t.start()
+for t in threads:
+    t.join()
+print 'end:', ctime()
